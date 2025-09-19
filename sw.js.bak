@@ -1,0 +1,129 @@
+// Service Worker para Sistema Metru
+const CACHE_NAME = 'metru-v1';
+const urlsToCache = [
+  '/Metru/trabajador/index.php',
+  '/Metru/trabajador/crear_factura.php',
+  '/Metru/css/style.css',
+  '/Metru/js/main.js',
+  'https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css',
+  'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css'
+];
+
+// Instalar Service Worker
+self.addEventListener('install', event => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then(cache => cache.addAll(urlsToCache))
+  );
+});
+
+// Activar Service Worker
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys().then(cacheNames => {
+      return Promise.all(
+        cacheNames.filter(cacheName => {
+          return cacheName !== CACHE_NAME;
+        }).map(cacheName => {
+          return caches.delete(cacheName);
+        })
+      );
+    })
+  );
+});
+
+// Interceptar peticiones
+self.addEventListener('fetch', event => {
+  // Solo cachear GET requests
+  if (event.request.method !== 'GET') {
+    // Para POST requests (como crear facturas), guardar en IndexedDB si está offline
+    if (!navigator.onLine && event.request.url.includes('guardar_factura_offline.php')) {
+      event.respondWith(
+        new Response(JSON.stringify({success: true, offline: true}), {
+          headers: {'Content-Type': 'application/json'}
+        })
+      );
+    }
+    return;
+  }
+
+  event.respondWith(
+    caches.match(event.request)
+      .then(response => {
+        // Cache hit - return response
+        if (response) {
+          return response;
+        }
+
+        return fetch(event.request).then(
+          response => {
+            // Check if we received a valid response
+            if(!response || response.status !== 200 || response.type !== 'basic') {
+              return response;
+            }
+
+            // Clone the response
+            var responseToCache = response.clone();
+
+            caches.open(CACHE_NAME)
+              .then(cache => {
+                cache.put(event.request, responseToCache);
+              });
+
+            return response;
+          }
+        );
+      })
+  );
+});
+
+// Sincronización en background
+self.addEventListener('sync', event => {
+  if (event.tag === 'sync-facturas') {
+    event.waitUntil(syncFacturas());
+  }
+});
+
+async function syncFacturas() {
+  // Obtener facturas pendientes de IndexedDB
+  const db = await openDB();
+  const tx = db.transaction('facturas_pendientes', 'readonly');
+  const store = tx.objectStore('facturas_pendientes');
+  const facturas = await store.getAll();
+
+  for (const factura of facturas) {
+    try {
+      const response = await fetch('/Metru/includes/sincronizar_factura.php', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(factura)
+      });
+
+      if (response.ok) {
+        // Eliminar de IndexedDB si se sincronizó correctamente
+        const deleteTx = db.transaction('facturas_pendientes', 'readwrite');
+        await deleteTx.objectStore('facturas_pendientes').delete(factura.id);
+      }
+    } catch (error) {
+      console.error('Error sincronizando factura:', error);
+    }
+  }
+}
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('MetruDB', 1);
+    
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    
+    request.onupgradeneeded = event => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains('facturas_pendientes')) {
+        db.createObjectStore('facturas_pendientes', { keyPath: 'id', autoIncrement: true });
+      }
+    };
+  });
+}
